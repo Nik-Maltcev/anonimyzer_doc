@@ -1,0 +1,5 @@
+{
+  "name": "DocAnonymizer AI",
+  "description": "A bulk document anonymization tool utilizing Gemini 3.0 Pro. Upload .docx contracts to automatically redact personal data into specific tags like [NAME], [PASSPORT], [ADDRESS] while preserving business context.",
+  "requestFramePermissions": []
+}
