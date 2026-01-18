@@ -167,6 +167,17 @@ async function redactTextBlock(textBlock: string, index: number, total: number):
     });
 
     const resultText = response.text || "";
+    
+    // Fallback: if response is empty or too short, return original chunk
+    if (!resultText || resultText.length < textBlock.length * 0.3) {
+        log('WARN', `⚠️ Empty or too short response, using original chunk`, {
+            originalLength: textBlock.length,
+            responseLength: resultText.length
+        });
+        timer.log(`⚠️ Fallback to original`);
+        return textBlock;
+    }
+    
     timer.log(`✅ Done (output: ${resultText.length} chars)`);
     return resultText;
 }
@@ -208,7 +219,18 @@ async function verifyAndCleanup(text: string, index?: number, total?: number): P
         });
     });
 
-    const resultText = response.text || text;
+    const resultText = response.text || "";
+    
+    // Fallback: if response is empty, return original text
+    if (!resultText || resultText.length < text.length * 0.3) {
+        log('WARN', `⚠️ Verification returned empty/short, keeping previous result`, {
+            originalLength: text.length,
+            responseLength: resultText.length
+        });
+        timer.log(`⚠️ Fallback to input`);
+        return text;
+    }
+    
     timer.log(`✅ Done (output: ${resultText.length} chars)`);
     return resultText;
 }
@@ -223,8 +245,8 @@ export const anonymizeDocumentText = async (fullText: string): Promise<string> =
         estimatedChunks: Math.ceil(fullText.length / 4000)
     });
     
-    // Split into chunks by paragraphs to keep context (increased from 4000 to 8000 for fewer API calls)
-    const chunks = chunkByParagraphs(fullText, 8000);
+    // Split into chunks by paragraphs (reduced back to 5000 for stability)
+    const chunks = chunkByParagraphs(fullText, 5000);
     let resultText = "";
 
     // First pass: main anonymization
@@ -247,7 +269,7 @@ export const anonymizeDocumentText = async (fullText: string): Promise<string> =
     const pass2Timer = createTimer('Pass 2');
     await delay(2000);
     
-    const verificationChunks = chunkByParagraphs(resultText.trim(), 10000);
+    const verificationChunks = chunkByParagraphs(resultText.trim(), 7000);
     log('INFO', `📋 Pass 2: Verification`, { totalChunks: verificationChunks.length });
     
     let verifiedText = "";
