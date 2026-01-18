@@ -1,9 +1,33 @@
 import { GoogleGenAI } from "@google/genai";
 
+// Enhanced logging helper
+const log = (level: 'INFO' | 'WARN' | 'ERROR' | 'DEBUG', message: string, data?: any) => {
+  const timestamp = new Date().toISOString();
+  const prefix = `[${timestamp}] [Gemini] [${level}]`;
+  if (data) {
+    console.log(`${prefix} ${message}`, JSON.stringify(data, null, 2));
+  } else {
+    console.log(`${prefix} ${message}`);
+  }
+};
+
+// Performance timer helper
+const createTimer = (label: string) => {
+  const start = Date.now();
+  return {
+    elapsed: () => Date.now() - start,
+    log: (message?: string) => {
+      const elapsed = Date.now() - start;
+      log('INFO', `⏱️ ${label}: ${elapsed}ms ${message || ''}`);
+      return elapsed;
+    }
+  };
+};
+
 const getClient = () => {
   const apiKey = process.env.API_KEY;
   if (!apiKey) {
-    console.error("API Key is missing!");
+    log('ERROR', "API Key is missing!");
     throw new Error("API Key not found in environment variables");
   }
   return new GoogleGenAI({ apiKey });
@@ -16,7 +40,7 @@ const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
  * Splits text by paragraphs and groups them into chunks of roughly targetSize.
  * This is better than character-based chunking because it preserves sentences.
  */
-function chunkByParagraphs(text: string, targetSize: number = 5000): string[] {
+function chunkByParagraphs(text: string, targetSize: number = 8000): string[] {
     const paragraphs = text.split(/\r?\n/);
     const chunks: string[] = [];
     let currentChunk = "";
@@ -41,16 +65,27 @@ function chunkByParagraphs(text: string, targetSize: number = 5000): string[] {
  */
 async function generateWithRetry(callApi: () => Promise<any>, retries = 5, delayBase = 2000): Promise<any> {
     for (let i = 0; i < retries; i++) {
+        const timer = createTimer(`API call attempt ${i + 1}`);
         try {
-            return await callApi();
+            const result = await callApi();
+            timer.log('✅ Success');
+            return result;
         } catch (error: any) {
             const isRateLimit = error.message?.includes('429') || error.status === 429 || error.toString().includes('Too Many Requests');
+            const errorInfo = {
+                attempt: i + 1,
+                isRateLimit,
+                message: error.message,
+                status: error.status
+            };
+            
             if (isRateLimit && i < retries - 1) {
                 const waitTime = delayBase * Math.pow(2, i);
-                console.warn(`[Gemini] Rate limit. Waiting ${waitTime}ms...`);
+                log('WARN', `🚫 Rate limit hit, waiting ${waitTime}ms...`, errorInfo);
                 await delay(waitTime);
                 continue;
             }
+            log('ERROR', `❌ API call failed`, errorInfo);
             throw error;
         }
     }
@@ -60,7 +95,12 @@ async function generateWithRetry(callApi: () => Promise<any>, retries = 5, delay
  * Asks Gemini to redact a specific block of text and return the REDACTED TEXT.
  */
 async function redactTextBlock(textBlock: string, index: number, total: number): Promise<string> {
-    console.log(`[Gemini] Redacting chunk ${index + 1}/${total}...`);
+    const timer = createTimer(`Chunk ${index + 1}/${total}`);
+    log('INFO', `📝 Processing chunk ${index + 1}/${total}`, {
+        chunkLength: textBlock.length,
+        preview: textBlock.substring(0, 100) + '...'
+    });
+    
     const ai = getClient();
 
     const systemPrompt = `Ты — строгий эксперт по защите персональных данных (ПДн) в соответствии с 152-ФЗ.
@@ -126,14 +166,19 @@ async function redactTextBlock(textBlock: string, index: number, total: number):
         });
     });
 
-    return response.text || "";
+    const resultText = response.text || "";
+    timer.log(`✅ Done (output: ${resultText.length} chars)`);
+    return resultText;
 }
 
 /**
  * Second pass verification to catch any missed PII
  */
-async function verifyAndCleanup(text: string): Promise<string> {
-    console.log(`[Gemini] Running verification pass...`);
+async function verifyAndCleanup(text: string, index?: number, total?: number): Promise<string> {
+    const label = index !== undefined ? `Verify ${index + 1}/${total}` : 'Verification';
+    const timer = createTimer(label);
+    log('INFO', `🔍 ${label} starting`, { textLength: text.length });
+    
     const ai = getClient();
 
     const verifyPrompt = `Проверь текст на наличие ПРОПУЩЕННЫХ персональных данных.
@@ -163,41 +208,69 @@ async function verifyAndCleanup(text: string): Promise<string> {
         });
     });
 
-    return response.text || text;
+    const resultText = response.text || text;
+    timer.log(`✅ Done (output: ${resultText.length} chars)`);
+    return resultText;
 }
 
 /**
  * Main entry point for full document anonymization
  */
 export const anonymizeDocumentText = async (fullText: string): Promise<string> => {
-    console.log(`[Gemini] Starting full text anonymization (${fullText.length} chars)`);
+    const totalTimer = createTimer('Total anonymization');
+    log('INFO', `🚀 Starting full text anonymization`, {
+        totalChars: fullText.length,
+        estimatedChunks: Math.ceil(fullText.length / 4000)
+    });
     
-    // Split into chunks by paragraphs to keep context
-    const chunks = chunkByParagraphs(fullText, 4000); // Reduced chunk size for better accuracy
+    // Split into chunks by paragraphs to keep context (increased from 4000 to 8000 for fewer API calls)
+    const chunks = chunkByParagraphs(fullText, 8000);
     let resultText = "";
 
     // First pass: main anonymization
-    console.log(`[Gemini] Pass 1: Main anonymization (${chunks.length} chunks)`);
+    log('INFO', `📋 Pass 1: Main anonymization`, { totalChunks: chunks.length });
+    const pass1Timer = createTimer('Pass 1');
+    
     for (let i = 0; i < chunks.length; i++) {
-        if (i > 0) await delay(1500); // Breathe between chunks
+        if (i > 0) {
+            log('DEBUG', `⏸️ Delay 1500ms before chunk ${i + 1}`);
+            await delay(1500);
+        }
         
         const redactedChunk = await redactTextBlock(chunks[i], i, chunks.length);
         resultText += redactedChunk + "\n\n";
     }
+    pass1Timer.log(`✅ Pass 1 complete`);
 
     // Second pass: verification to catch missed PII
-    console.log(`[Gemini] Pass 2: Verification pass`);
+    log('INFO', `🔍 Pass 2: Verification pass starting`);
+    const pass2Timer = createTimer('Pass 2');
     await delay(2000);
     
-    const verificationChunks = chunkByParagraphs(resultText.trim(), 6000);
+    const verificationChunks = chunkByParagraphs(resultText.trim(), 10000);
+    log('INFO', `📋 Pass 2: Verification`, { totalChunks: verificationChunks.length });
+    
     let verifiedText = "";
     
     for (let i = 0; i < verificationChunks.length; i++) {
-        if (i > 0) await delay(1500);
+        if (i > 0) {
+            log('DEBUG', `⏸️ Delay 1500ms before verification chunk ${i + 1}`);
+            await delay(1500);
+        }
         
-        const verifiedChunk = await verifyAndCleanup(verificationChunks[i]);
+        const verifiedChunk = await verifyAndCleanup(verificationChunks[i], i, verificationChunks.length);
         verifiedText += verifiedChunk + "\n\n";
     }
+    pass2Timer.log(`✅ Pass 2 complete`);
+
+    const totalTime = totalTimer.log(`🏁 Anonymization complete`);
+    log('INFO', `📊 Final stats`, {
+        inputChars: fullText.length,
+        outputChars: verifiedText.trim().length,
+        pass1Chunks: chunks.length,
+        pass2Chunks: verificationChunks.length,
+        totalTimeMs: totalTime
+    });
 
     return verifiedText.trim();
 };
